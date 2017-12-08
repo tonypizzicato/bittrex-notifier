@@ -1,0 +1,16 @@
+{
+  "name": "bittrex",
+  "version": "0.1.0",
+  "description": "bittrex rates notifier",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "tony.pizzicato",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^0.17.1",
+    "growl": "^1.10.3",
+    "minimist": "^1.2.0"
+  }
+}
