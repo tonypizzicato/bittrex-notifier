@@ -26,7 +26,14 @@ const emitter = new EventEmitter();
 const API_KEY = argv['k'];
 const API_SECRET = argv['s'];
 const LOOP_INTERVAL = argv['p'] || 20 * 1000;
-const RATE_CHANGE_INTERVALS = [2 * 60 * 1000, 30 * 60 * 1000];
+const RATE_CHANGE_INTERVALS = [
+  2 * 60 * 1000,
+  5 * 60 * 1000,
+  10 * 60 * 1000,
+  15 * 60 * 1000,
+  20 * 60 * 1000,
+  30 * 60 * 1000,
+];
 
 const ORDER_AMOUNT_BTC = argv['a'] || 0.001;
 
@@ -137,8 +144,8 @@ emitter.on('rate', (market, rate) => {
       const startValue = marketValues[marketValues.length - indexshift];
       const change = rate.value / startValue.value - 1;
 
-      if (change > 0.08) {
-        emitter.emit('explosion', market, rate, change);
+      if (change > 0.12) {
+        emitter.emit('explosion', market, rate, change, i);
       }
     }
   });
@@ -150,9 +157,11 @@ emitter.on('rate', (market, rate) => {
     const change = rate.value / order.rate.value - 1;
 
     // check if we need to buy and take profit or sell and stop loss
-    if (change > 0.12 || change < -0.05) {
+    if (change >= 0.25 || change <= -0.1) {
       // remove order from active orders and add to history
-      store.history.concat(_.remove(store.orders, o => o.market === market));
+      const [order] = _.remove(store.orders, o => o.market === market);
+
+      store.history = store.history.concat([{ market, open: order.rate, close: rate }]);
 
       emitter.emit('result', market, rate, order, change);
     }
@@ -161,10 +170,10 @@ emitter.on('rate', (market, rate) => {
 
 // buy on explosive market
 emitter.on('explosion', (market, rate, change) => {
-  console.log('Explosive change on', market, '. Change:', change);
+  console.log('Explosive change on', market, '. Change:', change, !!store.banned[market] ? '[BANNED]' : '');
 
   if (!store.orders.some(o => o.market === market) && !store.banned[market]) {
-    store.orders.push({ market, rate });
+    _.defer(() => store.orders.push({ market, rate }));
   }
 });
 
@@ -183,7 +192,7 @@ emitter.on('result', (market, rate, order, change) => {
   store.result += change;
 
   if (change < 0) {
-    _.set(state, `banned.${market}`, { ...order.rate.time });
+    _.set(store, `banned.${market}`, { ...order });
   }
 
   console.log('==========================');
@@ -206,16 +215,20 @@ emitter.on('total-growth', (market, rate, change) => {
   });
 });
 
-// emitter.on('explosion', (market, rate, change) => {
-//   growl(`Explosive growth of ${market}!!!`, {
-//     group: 'bittrex',
-//     title: 'Bittrex',
-//     subtitle: `Explosive growth found - ${change.toFixed(2)}%`,
-//     image: 'logo.png',
-//     url: `https://bittrex.com/Market/Index?MarketName=${market}`,
-//     sound: 'default',
-//   });
-// });
+emitter.on('explosion', (market, rate, change, interval) => {
+  if (store.orders.some(o => o.market === market) || store.banned[market]) {
+    return;
+  }
+
+  growl(`Explosive growth of ${market}!!!`, {
+    group: 'bittrex',
+    title: 'Bittrex',
+    subtitle: `Growth ${change.toFixed(2)}% in ${interval / 60 / 1000}min`,
+    image: 'logo.png',
+    url: `https://bittrex.com/Market/Index?MarketName=${market}`,
+    sound: 'default',
+  });
+});
 
 emitter.on('result', (market, rate, order, change) => {
   growl(`Order: ${change.toFixed(2)}% on ${market}`, {
