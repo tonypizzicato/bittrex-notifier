@@ -25,8 +25,15 @@ module.exports = function(store) {
     res.send(store.active);
   });
 
-  Object.keys(store).forEach(key => {
-    app.get(`/${key}`, (req, res) => res.json(store[key]));
+  app.get('*', (req, res) => {
+    const path = _.trim(req.path.replace(/\//g, '.'), '.');
+    const value = _.get(store, path);
+
+    if (value !== void 0 && value !== null) {
+      return res.json(value);
+    }
+
+    res.status(404).end();
   });
 
   app.listen(3000, () => console.log('HTTP interface available on port 3000'));

@@ -4,16 +4,15 @@ const EventEmitter = require('events');
 const growl = require('growl');
 const argv = require('minimist')(process.argv.slice(2));
 const _ = require('lodash');
-const moment = require('moment');
-const WebSocket = require('ws');
+const moment = require('moment-timezone');
 const bittrex = require('./node.bittrex.api');
-
-const signalR = require('signalr-client');
 
 const websockets_baseurl = 'wss://socket.bittrex.com/signalr';
 const websockets_hubs = ['CoreHub'];
 
 const server = require('./server');
+
+moment.tz.setDefault('GMT');
 
 const store = {
   markets: [],
@@ -41,7 +40,10 @@ const store = {
     },
   },
   rising: {},
-  result: 0,
+  result: {
+    active: 0,
+    finished: 0,
+  },
   active: true,
   balancechange: 0,
 };
@@ -72,7 +74,7 @@ const ORDER_AMOUNT_BTC = argv['a'] || 0.001;
 // percents between current and previous values
 const BUY_GROWTH_THRESHOLD = 0.08;
 const RISING_THRESHOLD = 0.07; // 0.07
-const SELL_GROWTH_THRESHOLD = 0.01;
+const SELL_GROWTH_THRESHOLD = 0.05;
 const SELL_FALL_THRESHOLD = -1;
 
 const NOT_FOR_TRADE = ['ETH', 'MONA', 'MANA', 'ADT', 'BSD', 'VOX'];
@@ -134,7 +136,9 @@ function buylimit(market, rate) {
   console.log(`Trying to BUY ${amount} ${market.substring(4)} for ${rate} per item. Total BID: ${amount * rate}`);
 
   if (!REAL_ORDERS) {
-    return Promise.resolve({ uuid: 'fakeid' });
+    return Promise.resolve({
+      uuid: 'fakeid',
+    });
   }
 
   const nonce = getNonce();
@@ -157,7 +161,9 @@ function selllimit(market, rate) {
   console.log(`Trying to SELL ${amount} ${market.substring(4)} for ${rate} per item. Total ASK: ${amount * rate}`);
 
   if (!REAL_ORDERS) {
-    return Promise.resolve({ uuid: 'fakeid' });
+    return Promise.resolve({
+      uuid: 'fakeid',
+    });
   }
 
   const nonce = getNonce();
@@ -193,23 +199,6 @@ function getBalance() {
 
   return axios.get(uri, getHeaders(signature)).then(response => response.data.result);
 }
-
-wsclient = new signalR.client(websockets_baseurl, websockets_hubs, undefined, true);
-
-bittrex.websockets.listen(function(data, client) {
-  if (data.M === 'updateSummaryState') {
-    data.A.forEach(data => {
-      data.Deltas.filter(m => m.MarketName.indexOf('BTC-') === 0).forEach(m => {
-        emitter.emit('rate', m.MarketName, {
-          value: m.Last,
-          bid: m.Bid,
-          ask: m.Ask,
-          time: moment(m.TimeStamp).unix(),
-        });
-      });
-    });
-  }
-});
 
 function fetchLoop() {
   getRates()
@@ -381,8 +370,9 @@ emitter.on('minmax', market => {
 
 // update results
 emitter.on('result', (market, rate, order, change) => {
-  const old = store.result;
-  store.result += change;
+  const old = store.result.finished;
+
+  store.result.finished += change;
 
   if (change < 0) {
     _.set(store, banned, market, {
@@ -403,7 +393,7 @@ emitter.on('result', (market, rate, order, change) => {
   console.log('Buy rate:', order.rate.value.toFixed(8), '. Sell rate:', rate.value.toFixed(8));
   console.log('Spent BTC:', ORDER_AMOUNT_BTC, '. Buy amount:', (ORDER_AMOUNT_BTC / order.rate.value).toFixed(4));
   console.log('Received BTC:', (ORDER_AMOUNT_BTC / order.rate.value * rate.value).toFixed(4));
-  console.log('Prev result:', old.toFixed(8), '. New value:', store.result.toFixed(8));
+  console.log('Prev result:', old.toFixed(8), '. New value:', store.result.finished.toFixed(8));
   console.log('==========================');
 });
 
@@ -485,6 +475,8 @@ markets
   .then(markets => {
     _.set(store, 'markets', markets);
 
+    emitter.emit('markets', markets);
+
     return markets;
   })
   // .then(markets => {
@@ -493,6 +485,205 @@ markets
   //   return markets;
   // })
   .catch(err => console.warn('Error:', err.message));
+
+bittrex.options({
+  websockets: {
+    onConnect: function() {
+      console.log('Websocket connected');
+    },
+    onDisconnect: function() {
+      console.log('Websocket disconnected');
+    },
+  },
+});
+
+// emitter.on('markets', () => {
+//   bittrex.websockets.listen(data => {
+//     if (data.M === 'updateSummaryState') {
+//       data.A.forEach(data => {
+//         data.Deltas.filter(m => m.MarketName.indexOf('BTC-') === 0).forEach(m => {
+//           emitter.emit('rate', m.MarketName, {
+//             value: m.Last,
+//             bid: m.Bid,
+//             ask: m.Ask,
+//             time: moment(m.TimeStamp).unix(),
+//           });
+//         });
+//       });
+//     }
+//   });
+// });
+
+emitter.on('markets', markets => {
+  bittrex.websockets.subscribe(markets, data => {
+    if (data.M === 'updateExchangeState') {
+      data.A.forEach(function(data_for) {
+        const market = data_for.MarketName;
+        const rates = data_for.Fills.map(f => ({
+          value: f.Rate,
+          time: moment(f.TimeStamp).unix(),
+        }));
+
+        if (rates.length) {
+          emitter.emit('rates', market, rates);
+        }
+      });
+    }
+  });
+});
+
+const PERIOD_MINUTES = 1;
+
+emitter.on('rates', (market, rates) => {
+  const now = moment().unix();
+  const newrates = _.get(store.values, market, []).concat(rates);
+
+  const periodStartIndex = _.findLastIndex(newrates, r => now - r.time > PERIOD_MINUTES * 60);
+
+  if (periodStartIndex > 0) {
+    const periodRates = newrates.slice(periodStartIndex);
+
+    _.set(store.values, market, newrates.slice(periodStartIndex));
+
+    const getValue = r => r.value;
+    const first = _.first(periodRates);
+    const last = _.last(periodRates);
+    const max = _.maxBy(periodRates, getValue);
+    const min = _.minBy(periodRates, getValue);
+    const mean = _.meanBy(periodRates, getValue);
+
+    const change = max.value / min.value - 1;
+    const half = (max.value - min.value) / 2 + min.value;
+
+    if (max.time > min.time && last.value > first.value) {
+      // if (change > 0.01 && mean > half) {
+      if (change > 0.02) {
+        // console.log(market, min.value, max.value, mean, half, change);
+        emitter.emit('_explosion', market, _.last(rates), change, PERIOD_MINUTES);
+      }
+    }
+  } else {
+    _.set(store.values, market, newrates);
+  }
+});
+
+// buy on explosive market
+emitter.on('_explosion', (market, rate, change, period) => {
+  const banned = store.banned[market] && store.banned[market].count > 2;
+
+  if (store.active && !store.orders.some(o => o.market === market) && !banned) {
+    // console.log(
+    //   `Explosive change in ${period} minutes on ${market}. Change: ${change} ${
+    //     banned ? '[BANNED]' : ''
+    //   } ${moment().format()}`
+    // );
+
+    if (NOT_FOR_TRADE.indexOf(market.substring(4)) > -1) {
+      console.warn(`${market} is not for trading!`);
+
+      return;
+    }
+
+    const rising = _.get(store.rising, market, { time: rate.time, count: 0 });
+
+    if (rising.count < 3) {
+      const timediff = rate.time - rising.time;
+      if (
+        (rising.count == 0 && timediff === 0) ||
+        (timediff > PERIOD_MINUTES * 60 && timediff < 10 * PERIOD_MINUTES * 60)
+      ) {
+        rising.count && console.log('UPDATE GROWTH:', market, rate.time, rising.time, timediff);
+
+        _.set(store.rising, market, { count: rising.count + 1, time: rate.time });
+      }
+
+      return;
+    }
+
+    emitter.emit('buy', market, rate, change, period);
+
+    buylimit(market, rate.value)
+      .then(res => {
+        console.log('BUY order placed');
+
+        return res;
+      })
+      .then(res => {
+        updateBalances();
+
+        _.defer(() =>
+          store.orders.push({
+            market,
+            rate,
+            change: 0,
+            amount: 0.00001,
+            id: res.uuid,
+          })
+        );
+      })
+      .catch(err => console.warn(`BUY err: ${err.message}`));
+  }
+});
+
+emitter.on('rates', (market, rates) => {
+  store.orders.filter(o => o.market === market).forEach(order => {
+    const now = moment().unix();
+    const rate = _.last(rates);
+    const change = rate.value / order.rate.value - 1;
+
+    const orderIndex = _.findIndex(store.orders, o => o.market === market);
+
+    _.set(store.orders, `${orderIndex}.change`, change);
+
+    // check if we need to buy and take profit or sell and stop loss
+    // if (change >= SELL_GROWTH_THRESHOLD || change <= SELL_FALL_THRESHOLD) {
+    if (
+      change >= 0.04 ||
+      (change >= 0.03 && now - store.orders[orderIndex].rate.time > 5 * 60) ||
+      (change >= 0.01 && now - store.orders[orderIndex].rate.time > 10 * 60) ||
+      (change >= 0.001 && now - store.orders[orderIndex].rate.time > 20 * 60) ||
+      (change > 0 && now - store.orders[orderIndex].rate.time > 60 * 60)
+    ) {
+      selllimit(market, rate.value)
+        .then(res => {
+          console.log('SELL order placed');
+
+          return res;
+        })
+        .then(res => {
+          // remove order from active orders and add to history
+          const [order] = _.remove(store.orders, o => o.market === market);
+
+          store.history = store.history.concat([
+            {
+              market,
+              open: order.rate,
+              close: rate,
+            },
+          ]);
+
+          emitter.emit('result', market, rate, order, change);
+        });
+    }
+  });
+
+  store.result.active = store.orders.reduce((acc, o) => (acc += o.change), 0);
+});
+
+emitter.on('buy', (market, rate, change, period) => {
+  if (store.orders.some(o => o.market === market) || store.banned[market]) {
+    return;
+  }
+
+  growl(`Explosive growth of ${market}!!!`, {
+    group: 'bittrex',
+    title: 'Bittrex',
+    subtitle: `Growth ${change.toFixed(2)}% in ${period} minutes`,
+    image: 'logo.png',
+    url: `https://bittrex.com/Market/Index?MarketName=${market}`,
+    sound: 'default',
+  });
+});
 
 // function updateLastValue(market, diff, current) {
 //   const lastValue = last[market];
