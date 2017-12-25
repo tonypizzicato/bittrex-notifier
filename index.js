@@ -17,7 +17,6 @@ moment.tz.setDefault('GMT');
 const store = {
   markets: [],
   values: {},
-  minmax: {},
   orders: [],
   history: [],
   balance: {},
@@ -45,10 +44,9 @@ const store = {
     finished: 0,
   },
   active: true,
+  silent: false,
   balancechange: 0,
 };
-
-server(store);
 
 const emitter = new EventEmitter();
 
@@ -57,27 +55,34 @@ const REAL_ORDERS = argv['r'];
 
 const API_KEY = argv['k'];
 const API_SECRET = argv['s'];
-const RATES_POLL_INTERVAL = argv['p'] || 10 * 1000;
-const RATE_CHANGE_INTERVALS = [
-  // 2 * 60 * 1000, maybe 2 minutes give not interesting result for me
-  1 * 60 * 1000,
-  // 10 * 60 * 1000,
-  15 * 60 * 1000,
-  // 20 * 60 * 1000,
-  30 * 60 * 1000,
-];
-// poll orders rates every 5 seconds;
-const ORDER_POLL_INTERVAL = 5 * 1000;
-
+const PORT = argv['p'];
 const ORDER_AMOUNT_BTC = argv['a'] || 0.001;
 
 // percents between current and previous values
-const BUY_GROWTH_THRESHOLD = 0.08;
-const RISING_THRESHOLD = 0.07; // 0.07
-const SELL_GROWTH_THRESHOLD = 0.05;
+const RISING_COUNT_THRESHOLD = 3;
+const EXPLOSION_THRESHOLD = 0.01; // 0.07
+const SELL_GROWTH_THRESHOLD = 0.02;
 const SELL_FALL_THRESHOLD = -1;
+const CHECK_RATE_PERIOD_MINUTES = 1;
 
-const NOT_FOR_TRADE = ['ETH', 'MONA', 'MANA', 'ADT', 'BSD', 'VOX'];
+const NOT_FOR_TRADE = ['ETH', 'MONA', 'MANA', 'BSD', 'VOX'];
+
+const addCustomRoutes = app => {
+  app.get('/info', (req, res) => {
+    res.json({
+      RISING_COUNT_THRESHOLD,
+      EXPLOSION_THRESHOLD,
+      SELL_GROWTH_THRESHOLD,
+      SELL_FALL_THRESHOLD,
+      CHECK_RATE_PERIOD_MINUTES,
+      NOT_FOR_TRADE,
+      REAL_ORDERS,
+      comments: '>= 0.1 :: 10 minutes; >= 0.001 :: 30 minutes',
+    });
+  });
+};
+
+const router = server(store, PORT, addCustomRoutes);
 
 function getHash(string) {
   var hmac = crypto.createHmac('sha512', key);
@@ -200,174 +205,6 @@ function getBalance() {
   return axios.get(uri, getHeaders(signature)).then(response => response.data.result);
 }
 
-function fetchLoop() {
-  getRates()
-    .then(markets => emitter.emit('tick', markets))
-    .catch(err => console.warn('Error:', err.message));
-
-  setTimeout(fetchLoop, RATES_POLL_INTERVAL);
-}
-
-function fetchOrderedLoop(market) {
-  getRate(market)
-    .then(tick => emitter.emit('tick', [tick]))
-    .catch(err => console.warn('Error:', err.message));
-
-  if (store.orders.some(o => o.market === market)) {
-    setTimeout(fetchOrderedLoop.bind(null, market), ORDER_POLL_INTERVAL);
-  }
-}
-
-function processTick(ticks) {
-  ticks.forEach(m => {
-    const time = moment(m.time).unix();
-
-    emitter.emit('rate', m.market, {
-      value: m.value,
-      time,
-    });
-  });
-}
-
-emitter.on('tick', processTick);
-
-// store rates
-emitter.on('rate', (market, rate) => {
-  _.set(store, `values.${market}`, _.get(store, `values.${market}`, []).concat(rate));
-});
-
-// store minmax
-emitter.on('rate', (market, rate) => {
-  const prev = _.get(store, `minmax.${market}`, {
-    ...minmaxdefault,
-  });
-
-  _.set(store, `minmax.${market}.min`, prev.min.value > rate.value ? rate : prev.min);
-  _.set(store, `minmax.${market}.max`, prev.max.value < rate.value ? rate : prev.max);
-
-  emitter.emit('minmax', market);
-});
-
-const BreakException = {};
-
-// check explosive changes
-emitter.on('rate', (market, rate) => {
-  try {
-    RATE_CHANGE_INTERVALS.forEach(i => {
-      const indexshift = Math.round(i / RATES_POLL_INTERVAL);
-      const marketValues = store.values[market];
-
-      if (marketValues.length > indexshift) {
-        const startValue = marketValues[marketValues.length - indexshift];
-        const change = rate.value / startValue.value - 1;
-
-        if (change > RISING_THRESHOLD) {
-          emitter.emit('explosion', market, rate, change, i);
-          throw BreakException;
-        }
-      }
-    });
-  } catch (e) {
-    if (e !== BreakException) throw e;
-  }
-});
-
-// check results
-emitter.on('rate', (market, rate) => {
-  store.orders.filter(o => o.market === market).forEach(order => {
-    const change = rate.value / order.rate.value - 1;
-
-    const orderIndex = _.findIndex(store.orders, o => o.market === market);
-
-    _.set(store, `orders.${orderIndex}.change`, change);
-
-    // check if we need to buy and take profit or sell and stop loss
-    if (change >= SELL_GROWTH_THRESHOLD || change <= SELL_FALL_THRESHOLD) {
-      selllimit(market, rate.value)
-        .then(res => {
-          console.log('SELL order placed');
-
-          return res;
-        })
-        .then(res => {
-          // remove order from active orders and add to history
-          const [order] = _.remove(store.orders, o => o.market === market);
-
-          store.history = store.history.concat([
-            {
-              market,
-              open: order.rate,
-              close: rate,
-            },
-          ]);
-
-          emitter.emit('result', market, rate, order, change);
-        });
-    }
-  });
-});
-
-// buy on explosive market
-emitter.on('explosion', (market, rate, change, i) => {
-  const banned = store.banned[market] && store.banned[market].count > 2;
-
-  console.log(
-    'Explosive change in',
-    i / 60 / 1000,
-    'min on',
-    market,
-    '. Change:',
-    change,
-    banned ? '[BANNED]' : '',
-    moment().format()
-  );
-
-  if (store.active && !store.orders.some(o => o.market === market) && !banned) {
-    if (NOT_FOR_TRADE.indexOf(market.substring(4)) > -1) {
-      console.warn(`${market} is not for trading!`);
-
-      return;
-    }
-
-    _.set(store.rising, market, {
-      count: _.get(store.rising, `${market}.count`, 0) + 1,
-      change: _.get(store.rising, `${market}.change`, 0) + change,
-    });
-
-    if (_.get(store.rising, `${market}.count`) >= 1) {
-      buylimit(market, rate.value)
-        .then(res => {
-          console.log('BUY order placed');
-
-          return res;
-        })
-        .then(res => {
-          updateBalances();
-
-          _.defer(() =>
-            store.orders.push({
-              market,
-              rate,
-              change: 0,
-              amount: 0.00001,
-              id: res.uuid,
-            })
-          );
-        })
-        .catch(err => console.warn(`BUY err: ${err.message}`));
-    }
-  }
-});
-
-// check maximum growth overall
-emitter.on('minmax', market => {
-  const minmax = store.minmax[market];
-
-  if (minmax.max / minmax.min - 1 > 0.2) {
-    emitter.emit('total-growth', market, rate, minmax.max / minmax.min - 1);
-  }
-});
-
 // update results
 emitter.on('result', (market, rate, order, change) => {
   const old = store.result.finished;
@@ -375,59 +212,37 @@ emitter.on('result', (market, rate, order, change) => {
   store.result.finished += change;
 
   if (change < 0) {
-    _.set(store, banned, market, {
+    _.set(store.banned, market, {
       ...order,
       count: _.get(store.banned, `${market}.count`, 0) + 1,
     });
 
     _.set(store.rising, market, {
       ...rate,
-      count: _.set(store.rising, `${market}.count`, 0) + 1,
+      count: 0,
     });
   } else {
-    _.set(store, `banned.${market}.count`, 0);
+    _.set(store.banned, `${market}.count`, 0);
   }
 
   console.log('==========================');
   console.log('Result changed.', market);
   console.log('Buy rate:', order.rate.value.toFixed(8), '. Sell rate:', rate.value.toFixed(8));
   console.log('Spent BTC:', ORDER_AMOUNT_BTC, '. Buy amount:', (ORDER_AMOUNT_BTC / order.rate.value).toFixed(4));
-  console.log('Received BTC:', (ORDER_AMOUNT_BTC / order.rate.value * rate.value).toFixed(4));
+  console.log('Received BTC:', (ORDER_AMOUNT_BTC / order.rate.value * rate.value).toFixed(5));
   console.log('Prev result:', old.toFixed(8), '. New value:', store.result.finished.toFixed(8));
   console.log('==========================');
 });
 
-emitter.on('total-growth', (market, rate, change) => {
-  growl(`${market} ${change.toFixed(2)}% growth`, {
-    group: 'bittrex',
-    title: 'Bittrex',
-    subtitle: 'Growth found',
-    image: 'logo.png',
-    url: `https://bittrex.com/Market/Index?MarketName=${market}`,
-    sound: 'default',
-  });
-});
-
-emitter.on('explosion', (market, rate, change, interval) => {
-  if (store.orders.some(o => o.market === market) || store.banned[market]) {
+emitter.on('result', (market, rate, order, change) => {
+  if (store.silent) {
     return;
   }
 
-  growl(`Explosive growth of ${market}!!!`, {
-    group: 'bittrex',
-    title: 'Bittrex',
-    subtitle: `Growth ${change.toFixed(2)}% in ${interval / 60 / 1000}min`,
-    image: 'logo.png',
-    url: `https://bittrex.com/Market/Index?MarketName=${market}`,
-    sound: 'default',
-  });
-});
-
-emitter.on('result', (market, rate, order, change) => {
   growl(`Order: ${change.toFixed(2)}% on ${market}`, {
     name: 'bittrex-notifier',
     group: 'bittrex',
-    title: 'Bittrex',
+    title: `Bittrex:${PORT}`,
     image: 'logo.png',
     url: `https://bittrex.com/Market/Index?MarketName=${market}`,
     sound: 'default',
@@ -479,11 +294,6 @@ markets
 
     return markets;
   })
-  // .then(markets => {
-  //   fetchLoop();
-
-  //   return markets;
-  // })
   .catch(err => console.warn('Error:', err.message));
 
 bittrex.options({
@@ -496,23 +306,6 @@ bittrex.options({
     },
   },
 });
-
-// emitter.on('markets', () => {
-//   bittrex.websockets.listen(data => {
-//     if (data.M === 'updateSummaryState') {
-//       data.A.forEach(data => {
-//         data.Deltas.filter(m => m.MarketName.indexOf('BTC-') === 0).forEach(m => {
-//           emitter.emit('rate', m.MarketName, {
-//             value: m.Last,
-//             bid: m.Bid,
-//             ask: m.Ask,
-//             time: moment(m.TimeStamp).unix(),
-//           });
-//         });
-//       });
-//     }
-//   });
-// });
 
 emitter.on('markets', markets => {
   bittrex.websockets.subscribe(markets, data => {
@@ -532,13 +325,11 @@ emitter.on('markets', markets => {
   });
 });
 
-const PERIOD_MINUTES = 1;
-
 emitter.on('rates', (market, rates) => {
   const now = moment().unix();
   const newrates = _.get(store.values, market, []).concat(rates);
 
-  const periodStartIndex = _.findLastIndex(newrates, r => now - r.time > PERIOD_MINUTES * 60);
+  const periodStartIndex = _.findLastIndex(newrates, r => now - r.time > CHECK_RATE_PERIOD_MINUTES * 60);
 
   if (periodStartIndex > 0) {
     const periodRates = newrates.slice(periodStartIndex);
@@ -556,10 +347,8 @@ emitter.on('rates', (market, rates) => {
     const half = (max.value - min.value) / 2 + min.value;
 
     if (max.time > min.time && last.value > first.value) {
-      // if (change > 0.01 && mean > half) {
-      if (change > 0.02) {
-        // console.log(market, min.value, max.value, mean, half, change);
-        emitter.emit('_explosion', market, _.last(rates), change, PERIOD_MINUTES);
+      if (change > EXPLOSION_THRESHOLD) {
+        emitter.emit('_explosion', market, _.last(rates), change, CHECK_RATE_PERIOD_MINUTES);
       }
     }
   } else {
@@ -572,29 +361,19 @@ emitter.on('_explosion', (market, rate, change, period) => {
   const banned = store.banned[market] && store.banned[market].count > 2;
 
   if (store.active && !store.orders.some(o => o.market === market) && !banned) {
-    // console.log(
-    //   `Explosive change in ${period} minutes on ${market}. Change: ${change} ${
-    //     banned ? '[BANNED]' : ''
-    //   } ${moment().format()}`
-    // );
-
     if (NOT_FOR_TRADE.indexOf(market.substring(4)) > -1) {
-      console.warn(`${market} is not for trading!`);
-
       return;
     }
 
-    const rising = _.get(store.rising, market, { time: rate.time, count: 0 });
+    const rising = _.get(store.rising, market, { count: 0, ...rate });
 
-    if (rising.count < 3) {
+    if (rising.count < RISING_COUNT_THRESHOLD) {
       const timediff = rate.time - rising.time;
-      if (
-        (rising.count == 0 && timediff === 0) ||
-        (timediff > PERIOD_MINUTES * 60 && timediff < 10 * PERIOD_MINUTES * 60)
-      ) {
+
+      if ((rising.count == 0 && timediff === 0) || timediff > CHECK_RATE_PERIOD_MINUTES * 60) {
         rising.count && console.log('UPDATE GROWTH:', market, rate.time, rising.time, timediff);
 
-        _.set(store.rising, market, { count: rising.count + 1, time: rate.time });
+        _.set(store.rising, market, { count: rising.count + 1, ...rate });
       }
 
       return;
@@ -635,14 +414,10 @@ emitter.on('rates', (market, rates) => {
 
     _.set(store.orders, `${orderIndex}.change`, change);
 
-    // check if we need to buy and take profit or sell and stop loss
-    // if (change >= SELL_GROWTH_THRESHOLD || change <= SELL_FALL_THRESHOLD) {
     if (
-      change >= 0.04 ||
-      (change >= 0.03 && now - store.orders[orderIndex].rate.time > 5 * 60) ||
+      change >= SELL_GROWTH_THRESHOLD ||
       (change >= 0.01 && now - store.orders[orderIndex].rate.time > 10 * 60) ||
-      (change >= 0.001 && now - store.orders[orderIndex].rate.time > 20 * 60) ||
-      (change > 0 && now - store.orders[orderIndex].rate.time > 60 * 60)
+      (change >= 0.001 && now - store.orders[orderIndex].rate.time > 30 * 60)
     ) {
       selllimit(market, rate.value)
         .then(res => {
@@ -675,32 +450,16 @@ emitter.on('buy', (market, rate, change, period) => {
     return;
   }
 
-  growl(`Explosive growth of ${market}!!!`, {
+  if (store.silent) {
+    return;
+  }
+
+  growl(`Buy ${market}`, {
     group: 'bittrex',
-    title: 'Bittrex',
+    title: `Bittrex:${PORT}`,
     subtitle: `Growth ${change.toFixed(2)}% in ${period} minutes`,
     image: 'logo.png',
     url: `https://bittrex.com/Market/Index?MarketName=${market}`,
     sound: 'default',
   });
 });
-
-// function updateLastValue(market, diff, current) {
-//   const lastValue = last[market];
-
-//   if (lastValue && (current > lastValue + diff || current < lastValue - diff)) {
-//     const currentStr = parseFloat(current).toFixed(2);
-//     const lastStr = parseFloat(lastValue).toFixed(2);
-//     const emoji = current > lastValue ? ':)' : ':(';
-
-//     growl(`${currentStr} vs ${lastStr} ${emoji}`, {
-//       group: 'bittrex',
-//       title: 'Bittrex',
-//       subtitle: 'Price changed',
-//       image: 'logo.png',
-//       url: `https://bittrex.com/Market/Index?MarketName=${market}`,
-//       sound: 'default',
-//     });
-//   }
-//   last[market] = current;
-// }

@@ -3,7 +3,7 @@ const app = express();
 const _ = require('lodash');
 
 // IMPORTANT: store is mutable here
-module.exports = function(store) {
+module.exports = function(store, port, addRoutes = () => void 0) {
   app.get('/', (req, res) => res.json(store));
 
   app.get('/orderssummary', (req, res) => {
@@ -25,6 +25,19 @@ module.exports = function(store) {
     res.send(store.active);
   });
 
+  app.post('/mute', (req, res) => {
+    store.silent = true;
+
+    res.send(store.silent);
+  });
+  app.post('/unmute', (req, res) => {
+    store.silent = false;
+
+    res.send(store.silent);
+  });
+
+  addRoutes(app);
+
   app.get('*', (req, res) => {
     const path = _.trim(req.path.replace(/\//g, '.'), '.');
     const value = _.get(store, path);
@@ -36,5 +49,7 @@ module.exports = function(store) {
     res.status(404).end();
   });
 
-  app.listen(3000, () => console.log('HTTP interface available on port 3000'));
+  app.listen(port, () => console.log('HTTP interface available on port', port));
+
+  return app;
 };
