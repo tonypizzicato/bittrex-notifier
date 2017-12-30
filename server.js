@@ -6,13 +6,17 @@ const _ = require('lodash');
 module.exports = function(store, port, addRoutes = () => void 0) {
   app.get('/', (req, res) => res.json(store));
 
-  app.get('/orderssummary', (req, res) => {
-    res.json({ activeorderschangepercent: store.orders.reduce((acc, o) => (acc += o.change), 0) });
-  });
-
   app.delete('/banned', (req, res) => res.json(_.set(store, 'banned', {})));
   app.delete('/banned/:market', (req, res) => res.send(_.unset(store, `banned.${req.params.market}`)));
   app.post('/banned/:market', (req, res) => res.send(_.set(store, `banned.${req.params.market}`, req.body)));
+
+  app.post('/settings/:field/:value', (req, res) => {
+    const number = _.toNumber(req.params.value);
+
+    return res.send(
+      _.set(store.settings, req.params.field, !isNaN(number) ? number : _.get(store.settings, req.params.field))
+    );
+  });
 
   app.post('/pause', (req, res) => {
     store.active = false;
